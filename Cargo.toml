@@ -1,0 +1,13 @@
+[package]
+name = "doh-stub"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A small DNS-over-HTTPS stub, a drop-in for the removed cloudflared proxy-dns"
+repository = "https://github.com/Urthella/doh-stub"
+
+[dependencies]
+ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
+
+[dev-dependencies]
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
