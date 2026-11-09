@@ -11,7 +11,7 @@
     {
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer openssl pkg-config ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
       });
