@@ -105,6 +105,7 @@ fn start_stub(upstreams: &[&str]) -> Stub {
     let addr = line
         .trim()
         .strip_prefix("doh-stub: listening on udp://")
+        .and_then(|rest| rest.split(' ').next())
         .unwrap()
         .to_string();
     Stub { child, addr }
@@ -276,5 +277,46 @@ fn ignores_packets_that_are_not_queries() {
         seen.lock().unwrap().len(),
         1,
         "only the real query went upstream"
+    );
+}
+
+#[test]
+fn answers_over_tcp_in_full_with_several_queries_per_connection() {
+    let txt = |_| {
+        let rdata = RData::TXT(TXT::new(vec!["x".repeat(200)]));
+        Record::from_rdata(Name::from_ascii("big.example.").unwrap(), 60, rdata)
+    };
+    let (url, seen) = fake_doh(move |q| (200, answer_with(q, (0..20).map(txt).collect())));
+    let stub = start_stub(&[&url]);
+
+    // A connection that sends a broken message and hangs up doesn't get in the next one's way.
+    let mut broken = TcpStream::connect(&stub.addr).unwrap();
+    broken.write_all(&[0, 3, 1, 2, 3]).unwrap();
+    drop(broken);
+
+    // Two queries sent back to back on one connection, before reading either answer.
+    let mut tcp = TcpStream::connect(&stub.addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    for id in [1u16, 2] {
+        let bytes = query(id, "big.example.", RecordType::TXT, None)
+            .to_vec()
+            .unwrap();
+        tcp.write_all(&(bytes.len() as u16).to_be_bytes()).unwrap();
+        tcp.write_all(&bytes).unwrap();
+    }
+    for id in [1u16, 2] {
+        let mut len = [0u8; 2];
+        tcp.read_exact(&mut len).unwrap();
+        let mut reply = vec![0u8; u16::from_be_bytes(len).into()];
+        tcp.read_exact(&mut reply).unwrap();
+        let reply = Message::from_vec(&reply).unwrap();
+        assert_eq!(reply.metadata.id, id);
+        assert!(!reply.metadata.truncation, "TCP answers aren't cut");
+        assert_eq!(reply.answers.len(), 20);
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "the broken message wasn't forwarded"
     );
 }

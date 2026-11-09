@@ -3,7 +3,8 @@
 
 mod dns;
 
-use std::net::UdpSocket;
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, process, thread};
@@ -13,10 +14,12 @@ use ureq::tls::{TlsConfig, TlsProvider};
 
 /// The defaults `cloudflared proxy-dns` used. IP addresses, so no DNS is needed to reach them.
 const DEFAULT_UPSTREAMS: [&str; 2] = ["https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query"];
-/// ponytail: a fixed pool of blocking workers caps queries in flight at 16; plenty for a home
-/// network or a Pi-hole, move to async if one stub has to serve thousands at once.
+/// ponytail: fixed pools of blocking workers cap it at 16 UDP queries and 16 TCP connections at
+/// once; plenty for a home network or a Pi-hole, move to async if one stub has to serve thousands.
 const WORKERS: usize = 16;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a TCP connection may sit idle before it's closed (RFC 7766 section 6.2.3).
+const TCP_IDLE: Duration = Duration::from_secs(10);
 const USAGE: &str = "usage: doh-stub [--address 127.0.0.1] [--port 53] [--upstream URL]...";
 
 struct Config {
@@ -102,6 +105,32 @@ fn serve_udp(socket: UdpSocket, agent: Agent, upstreams: Arc<[String]>) {
     }
 }
 
+fn serve_tcp(listener: TcpListener, agent: Agent, upstreams: Arc<[String]>) {
+    for stream in listener.incoming().flatten() {
+        let _ = answer_tcp(stream, &agent, &upstreams);
+    }
+}
+
+/// DNS over TCP (RFC 7766), where clients come after a UDP answer was cut: each message has its
+/// length in front, as two bytes, and one connection can carry several queries.
+fn answer_tcp(mut stream: TcpStream, agent: &Agent, upstreams: &[String]) -> io::Result<()> {
+    stream.set_read_timeout(Some(TCP_IDLE))?;
+    loop {
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len)?; // the client closing, or going idle, ends the connection
+        let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        stream.read_exact(&mut query)?;
+        if query.len() < dns::HEADER_LEN || dns::is_response(&query) {
+            return Ok(());
+        }
+        let reply = answer(agent, upstreams, &query);
+        // Upstream bodies are capped at 65535 bytes, so the length always fits.
+        let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
+        framed.extend(reply);
+        stream.write_all(&framed)?;
+    }
+}
+
 fn main() {
     let config = parse_args(env::args().skip(1)).unwrap_or_else(|message| {
         eprintln!("{message}");
@@ -114,10 +143,13 @@ fn main() {
         );
         process::exit(1)
     });
-    println!(
-        "doh-stub: listening on udp://{}",
-        socket.local_addr().unwrap()
-    );
+    // TCP on the address UDP got, so `--port 0` gives both the same port.
+    let address = socket.local_addr().unwrap();
+    let listener = TcpListener::bind(address).unwrap_or_else(|e| {
+        eprintln!("doh-stub: can't listen on tcp://{address}: {e}");
+        process::exit(1)
+    });
+    println!("doh-stub: listening on udp://{address} and tcp://{address}");
 
     let agent: Agent = Agent::config_builder()
         .tls_config(
@@ -130,13 +162,15 @@ fn main() {
         .build()
         .into();
     let upstreams: Arc<[String]> = config.upstreams.into();
-    let workers: Vec<_> = (0..WORKERS)
-        .map(|_| {
-            let socket = socket.try_clone().expect("a UDP socket can be shared");
-            let (agent, upstreams) = (agent.clone(), upstreams.clone());
-            thread::spawn(move || serve_udp(socket, agent, upstreams))
-        })
-        .collect();
+    let mut workers = Vec::new();
+    for _ in 0..WORKERS {
+        let socket = socket.try_clone().expect("a UDP socket can be shared");
+        let (a, u) = (agent.clone(), upstreams.clone());
+        workers.push(thread::spawn(move || serve_udp(socket, a, u)));
+        let listener = listener.try_clone().expect("a TCP listener can be shared");
+        let (a, u) = (agent.clone(), upstreams.clone());
+        workers.push(thread::spawn(move || serve_tcp(listener, a, u)));
+    }
     for worker in workers {
         let _ = worker.join();
     }

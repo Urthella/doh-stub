@@ -20,7 +20,7 @@ guide did.
 
 | Flag | Default | |
 |---|---|---|
-| `--address` | `127.0.0.1` | Where to listen. |
+| `--address` | `127.0.0.1` | Where to listen, on both UDP and TCP. |
 | `--port` | `53` | `0` picks a free port, which the startup line prints. |
 | `--upstream` | `https://1.1.1.1/dns-query`, `https://1.0.0.1/dns-query` | Repeat for more servers. They are tried in order. |
 
@@ -30,10 +30,10 @@ cloudflared's `--bootstrap`, `--metrics` and `--max-upstream-conns` aren't suppo
 
 ```mermaid
 flowchart LR
-    C[DNS client] -- "UDP query, ID n" --> S[doh-stub]
+    C[DNS client] -- "UDP or TCP query, ID n" --> S[doh-stub]
     S -- "HTTPS POST application/dns-message, ID 0" --> U1[upstream 1]
     S -. "if that fails" .-> U2[upstream 2]
-    S -- "answer, ID n, or TC if too big, or SERVFAIL" --> C
+    S -- "answer with ID n, TC if too big for UDP, or SERVFAIL" --> C
 ```
 
 - **Each query** is POSTed as `application/dns-message`. Its ID is set to 0 first, as RFC 8484
@@ -44,7 +44,10 @@ flowchart LR
   at once instead of waiting out its own timeout.
 - **Answers too big for the client's UDP size** are cut down to the question, with TC set. The
   client's UDP size is the one in its EDNS(0) record, or 512 bytes if it has none. TC tells
-  the client to ask again over TCP. This version doesn't listen on TCP yet.
+  the client to ask again over TCP.
+- **TCP** is served on the same address and port, following RFC 7766. Each message has a
+  two-byte length in front, and one connection can carry several queries. A connection
+  that is idle for 10 s is closed.
 - **No cache.** Pi-hole and most clients cache already.
 - **TLS comes from the operating system:** SChannel on Windows, OpenSSL on Linux, and the
   Security framework on macOS. No crypto is bundled.
@@ -62,26 +65,32 @@ flowchart LR
   - an HTTP 500 or a garbled reply moves on to the next upstream;
   - SERVFAIL comes back when every upstream fails, keeping the question and RD;
   - a 4 kB answer is cut for clients with no EDNS, with 1232 and with 100, but not with 8192;
+  - over TCP the same answer comes back whole;
+  - two queries on one TCP connection both get answers;
+  - a broken TCP message only ends its own connection;
   - packets that aren't queries get no reply.
 - **The parser.**
   - The EDNS size is found behind records whose names are compressed.
   - 20,000 damaged messages pass through it without a panic.
-- **Mutation testing.** Fifteen deliberate bugs were planted one at a time, and the tests caught
+- **Mutation testing.** Twenty deliberate bugs were planted one at a time, and the tests caught
   every one. The bugs included:
   - the ID not reset or not restored;
   - no failover;
   - a pointer read as one byte;
   - TC not set;
-  - SERVFAIL sent as NOERROR.
+  - SERVFAIL sent as NOERROR;
+  - TCP answers without their length;
+  - one query per TCP connection.
 - **A live run against Cloudflare**, on Windows with SChannel:
   - An A query was answered in 180 ms.
   - `google.com TXT` without EDNS came back as a 28-byte reply with TC set.
   - The same query with EDNS 4096 got all 17 answers in 1187 bytes.
+  - Over TCP, with no EDNS, it got all 17 answers in 1176 bytes.
 
 ## Limits
 
-- At most 16 queries are in flight at once, from a fixed pool of workers. That is plenty for a
-  home network or a Pi-hole.
+- At most 16 UDP queries and 16 TCP connections are handled at once, from fixed pools of
+  workers. That is plenty for a home network or a Pi-hole.
 - It uses HTTP/1.1 with keep-alive, not HTTP/2.
 
 ## Develop
